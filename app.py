@@ -4,9 +4,13 @@ from flask import Flask, render_template, request, session, send_file
 import umap
 import plotly.express as px
 from sklearn.decomposition import PCA
-from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
-from nn_model import Build_and_use_NN
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split
+from keras.models import Sequential
+from keras.layers import Dense
+from sklearn.metrics import roc_auc_score, confusion_matrix
+import numpy as np
 
 app = Flask(__name__)
 app.secret_key = 'supersecretkey'
@@ -14,6 +18,7 @@ app.secret_key = 'supersecretkey'
 UPLOAD_FOLDER = os.path.abspath(os.path.join(os.getcwd(), 'uploads'))
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+# Route for home page with file upload, feature selection, and model running options
 @app.route("/", methods=["GET", "POST"])
 def index():
     predictions_file = None
@@ -27,7 +32,6 @@ def index():
     if request.method == "POST":
         print("Index route triggered")
 
-        # Check for uploaded file
         if 'file' in request.files and request.files['file'].filename != '':
             file = request.files['file']
             filepath = os.path.join(UPLOAD_FOLDER, file.filename)
@@ -38,7 +42,6 @@ def index():
         if not filepath:
             return "No file uploaded. Please upload a CSV or Pickle file.", 400
 
-        # Load dataset
         try:
             if filepath.endswith(".pickle"):
                 data = pd.read_pickle(filepath)
@@ -52,13 +55,13 @@ def index():
             print(f"Error loading data: {str(e)}")
             return f"Error loading data: {str(e)}", 500
 
-        max_features = data.shape[1] - 2  # Exclude sample ID and target column
+        max_features = data.shape[1] - 2
         session['max_features'] = max_features
 
-        X = data.iloc[:, 1:-1]  # Features
-        y = data.iloc[:, -1]    # Labels
+        X = data.iloc[:, 1:-1]
+        y = data.iloc[:, -1]
 
-        # Feature Selection Logic (No cutoff, just rank all features)
+        # Feature Selection Route
         if 'feature_selection' in request.form:
             try:
                 print("Running feature selection...")
@@ -69,9 +72,8 @@ def index():
                     'Importance': rf.feature_importances_
                 }).sort_values(by='Importance', ascending=False)
 
-                # Save ranked feature importance without any cutoff
                 session['selected_features'] = feature_importance['Feature'].tolist()
-                feature_file = os.path.abspath(os.path.join(UPLOAD_FOLDER, "feature_importance.csv"))
+                feature_file = os.path.join(UPLOAD_FOLDER, "feature_importance.csv")
                 feature_importance.to_csv(feature_file, index=False)
                 print("Feature selection completed successfully.")
             except Exception as e:
@@ -83,64 +85,23 @@ def index():
                                    max_features=max_features,
                                    active_tab="feature_importance")
 
-        # Model Execution Logic (Cutoff applies here during actual model run)
+        # Run Model Route
         if 'run_model' in request.form:
-            try:
-                top_x_features = int(request.form.get('top_x_features', 10))
-                max_features = session.get('max_features', None)
-                print(f"Running model with top {top_x_features} features.")
+            print("Running neural network model...")
+            top_features = int(request.form.get("top_x_features", 0))
 
-                if top_x_features > max_features:
-                    return f"Error: You cannot select more than {max_features} features.", 400
+            # Use selected features or all features if cutoff not set
+            selected_features = session.get('selected_features', X.columns)
+            if top_features > 0:
+                selected_features = selected_features[:top_features]
 
-                selected_features = session.get('selected_features', None)
-                if selected_features is None:
-                    return "Please run feature selection first.", 400
+            X_selected = X[selected_features]
+            predictions, metrics = build_and_use_nn(X_selected, y, data.iloc[:, 0])  # Passing sample numbers as well
 
-                # Use the selected top X features
-                X_selected = X[selected_features[:top_x_features]]
-                if X_selected.empty:
-                    return "No features selected. Please try running feature selection again.", 400
-
-                print(f"Selected features: {X_selected.columns.tolist()}")
-
-                # Split the data
-                X_train, X_test, y_train, y_test = train_test_split(X_selected, y, test_size=0.2, random_state=42)
-                print("Data split for training and testing.")
-
-                # Call Neural Network Model
-                result_df, auc, sensitivity, specificity, prevalence = Build_and_use_NN(
-                    pd.concat([X_train, y_train], axis=1),
-                    feature_cutoff=top_x_features
-                )
-
-                print(f"Model execution completed. AUC: {auc}, Sensitivity: {sensitivity}, Specificity: {specificity}")
-
-                # Save predictions and metrics as CSV
-                predictions_file = os.path.abspath(os.path.join(UPLOAD_FOLDER, "predictions.csv"))
-                result_df.to_csv(predictions_file, index=False)
-
-                metrics = {
-                    'AUC': auc,
-                    'Sensitivity': sensitivity,
-                    'Specificity': specificity,
-                    'Prevalence': prevalence
-                }
-
-                metrics_file = os.path.abspath(os.path.join(UPLOAD_FOLDER, "metrics.csv"))
-                pd.DataFrame.from_dict(metrics, orient='index', columns=['Value']).to_csv(metrics_file)
-
-                # Pass predictions and metrics to the template
-                return render_template("index.html", 
-                                       predictions=result_df.to_html(classes='table table-striped'),
-                                       metrics=metrics,
-                                       predictions_file=predictions_file,
-                                       metrics_file=metrics_file,
-                                       active_tab="predictions")
-
-            except Exception as e:
-                print(f"Error during model execution: {str(e)}")
-                return f"Error during model execution: {str(e)}", 500
+            return render_template("index.html", 
+                                   predictions=predictions.to_html(classes='table table-striped'), 
+                                   metrics=metrics,
+                                   active_tab="predictions")
 
     return render_template("index.html", 
                            predictions_file=predictions_file, 
@@ -148,8 +109,57 @@ def index():
                            feature_importance=feature_importance, 
                            max_features=max_features)
 
+# Function for building and using the neural network
+def build_and_use_nn(X, y, sample_numbers):
+    # Encode target labels
+    le = LabelEncoder()
+    y_encoded = le.fit_transform(y)
 
-# ** UMAP Generation Route **
+    # Standardize features
+    PredictorScaler = StandardScaler()
+    X_scaled = PredictorScaler.fit_transform(X)
+
+    # Train-test split
+    X_train, X_test, y_train, y_test, sample_train, sample_test = train_test_split(
+        X_scaled, y_encoded, sample_numbers, test_size=0.3, random_state=42
+    )
+
+    # Build neural network
+    model = Sequential()
+    model.add(Dense(units=5, input_dim=X.shape[1], kernel_initializer='normal', activation='relu'))
+    model.add(Dense(units=5, kernel_initializer='normal', activation='tanh'))
+    model.add(Dense(1, kernel_initializer='normal', activation='sigmoid'))
+    model.compile(loss='binary_crossentropy', optimizer='adam')
+
+    model.fit(X_train, y_train, batch_size=20, epochs=50, verbose=1)
+
+    # Predictions and metrics
+    predictions = model.predict(X_test)
+    binary_predictions = (predictions > 0.5).astype(int)
+    predicted_labels = le.inverse_transform(binary_predictions.flatten().astype(int))
+
+    auc = roc_auc_score(y_test, predictions)
+    tn, fp, fn, tp = confusion_matrix(y_test, binary_predictions).ravel()
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else None
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else None
+    prevalence = (tp + fn) / len(y_test) if len(y_test) > 0 else None
+
+    metrics = {
+        'AUC': auc,
+        'Sensitivity': sensitivity,
+        'Specificity': specificity,
+        'Prevalence': prevalence
+    }
+
+    result_df = pd.DataFrame({
+        'Index': range(1, len(sample_test) + 1),
+        'Sample': sample_test.reset_index(drop=True),
+        'Predicted': predicted_labels
+    })
+
+    return result_df, metrics
+
+# UMAP Generation Route
 @app.route("/generate_umap", methods=["POST"])
 def generate_umap():
     print("UMAP route triggered")
@@ -159,16 +169,13 @@ def generate_umap():
             return "No file found. Please upload a file first.", 400
 
         data = pd.read_csv(filepath) if filepath.endswith(".csv") else pd.read_pickle(filepath)
-
         sample_numbers = data.iloc[:, 0]
         X = data.iloc[:, 1:-1]
         y = data.iloc[:, -1]
 
-        # Create UMAP embedding
         reducer = umap.UMAP()
         embedding = reducer.fit_transform(X)
 
-        # Create Plotly figure for UMAP
         umap_fig = px.scatter(
             x=embedding[:, 0],
             y=embedding[:, 1],
@@ -179,11 +186,8 @@ def generate_umap():
             title="UMAP Visualization"
         )
 
-        # Save the UMAP plot as an HTML file
         umap_html = os.path.join(UPLOAD_FOLDER, 'umap_plot.html')
         umap_fig.write_html(umap_html)
-
-        print("UMAP saved as HTML successfully.")
 
         return send_file(umap_html, as_attachment=True)
 
@@ -191,8 +195,7 @@ def generate_umap():
         print(f"Error generating UMAP: {str(e)}")
         return f"Error generating UMAP: {str(e)}", 500
 
-
-# ** PCA Generation Route **
+# PCA Generation Route
 @app.route("/generate_pca", methods=["POST"])
 def generate_pca():
     print("PCA route triggered")
@@ -202,16 +205,13 @@ def generate_pca():
             return "No file found. Please upload a file first.", 400
 
         data = pd.read_csv(filepath) if filepath.endswith(".csv") else pd.read_pickle(filepath)
-
         sample_numbers = data.iloc[:, 0]
         X = data.iloc[:, 1:-1]
         y = data.iloc[:, -1]
 
-        # Create PCA embedding
         pca = PCA(n_components=2)
         pca_embedding = pca.fit_transform(X)
 
-        # Create Plotly figure for PCA
         pca_fig = px.scatter(
             x=pca_embedding[:, 0],
             y=pca_embedding[:, 1],
@@ -222,27 +222,14 @@ def generate_pca():
             title="PCA Visualization"
         )
 
-        # Save the PCA plot as an HTML file
         pca_html = os.path.join(UPLOAD_FOLDER, 'pca_plot.html')
         pca_fig.write_html(pca_html)
-
-        print("PCA saved as HTML successfully.")
 
         return send_file(pca_html, as_attachment=True)
 
     except Exception as e:
         print(f"Error generating PCA: {str(e)}")
         return f"Error generating PCA: {str(e)}", 500
-
-
-# ** Download Routes for Predictions and Metrics **
-@app.route("/download_predictions")
-def download_predictions():
-    predictions_file = os.path.join(UPLOAD_FOLDER, "predictions.csv")
-    if os.path.exists(predictions_file):
-        return send_file(predictions_file, as_attachment=True)
-    else:
-        return "Predictions file not found.", 404
 
 @app.route("/download_metrics")
 def download_metrics():
@@ -252,5 +239,19 @@ def download_metrics():
     else:
         return "Metrics file not found.", 404
 
+@app.route("/download_predictions")
+def download_predictions():
+    predictions_file = os.path.join(UPLOAD_FOLDER, "predictions.csv")
+    if os.path.exists(predictions_file):
+        return send_file(predictions_file, as_attachment=True)
+    else:
+        return "Predictions file not found.", 404
+
+
+# Main entry point
 if __name__ == "__main__":
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
+
+  
